@@ -1,0 +1,18 @@
+# Maven
+target/
+
+# IDE and Editor metadata
+.idea/
+*.iml
+.vscode/
+.settings/
+.classpath
+.project
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.tmp
