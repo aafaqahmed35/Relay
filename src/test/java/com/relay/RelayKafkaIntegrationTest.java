@@ -384,26 +384,45 @@ class RelayKafkaIntegrationTest {
 
     @Test
     void failureDoesNotPoisonFutureValidEvents() {
+        String sharedAggregateId = "agg-shared-partition-" + UUID.randomUUID();
         String failingEventId = "evt-poison-fail-" + UUID.randomUUID();
-        String failingAggregateId = "agg-poison-fail-" + UUID.randomUUID();
-        RelayEvent failingEvent = new RelayEvent(failingEventId, failingAggregateId, "FAIL_ALWAYS", "{\"fail\":true}");
+        RelayEvent failingEvent = new RelayEvent(failingEventId, sharedAggregateId, "FAIL_ALWAYS", "{\"fail\":true}");
 
         String validEventId = "evt-poison-valid-" + UUID.randomUUID();
-        String validAggregateId = "agg-poison-valid-" + UUID.randomUUID();
-        RelayEvent validEvent = new RelayEvent(validEventId, validAggregateId, "UserLogin", "{\"valid\":true}");
+        RelayEvent validEvent = new RelayEvent(validEventId, sharedAggregateId, "UserLogin", "{\"valid\":true}");
 
-        producer.sendEvent(failingEvent).join();
-        producer.sendEvent(validEvent).join();
+        SendResult<String, RelayEvent> failResult = producer.sendEvent(failingEvent).join();
+        SendResult<String, RelayEvent> validResult = producer.sendEvent(validEvent).join();
+
+        assertThat(failResult.getRecordMetadata().partition())
+                .as("Both records MUST route to the exact same Kafka partition due to identical aggregateId key")
+                .isEqualTo(validResult.getRecordMetadata().partition());
 
         await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+            assertThat(attemptTracker.getAttemptCount(failingEventId))
+                    .as("Failing event MUST be attempted exactly 3 times total before dead-lettering")
+                    .isEqualTo(3);
+
+            List<RelayEvent> failingStoreEvents = eventStore.getReceivedEvents()
+                    .stream()
+                    .filter(e -> failingEventId.equals(e.eventId()))
+                    .toList();
+            assertThat(failingStoreEvents)
+                    .as("Failing event MUST NOT be recorded in EventStore")
+                    .isEmpty();
+
             List<RelayEvent> validStoreEvents = eventStore.getReceivedEvents()
                     .stream()
                     .filter(e -> validEventId.equals(e.eventId()))
                     .toList();
             assertThat(validStoreEvents)
-                    .as("Subsequent valid event MUST be processed successfully despite prior failing event")
+                    .as("Subsequent valid event on the same partition MUST be processed successfully")
                     .hasSize(1)
                     .contains(validEvent);
+
+            assertThat(attemptTracker.getAttemptCount(validEventId))
+                    .as("Valid event MUST have attempt count 1")
+                    .isEqualTo(1);
         });
     }
 
