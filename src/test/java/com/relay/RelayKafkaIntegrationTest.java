@@ -2,6 +2,7 @@ package com.relay;
 
 import com.relay.config.KafkaTopicConfig;
 import com.relay.consumer.EventStore;
+import com.relay.consumer.IdempotentEventProcessor;
 import com.relay.event.RelayEvent;
 import com.relay.producer.RelayEventProducer;
 import org.apache.kafka.clients.consumer.Consumer;
@@ -43,11 +44,15 @@ class RelayKafkaIntegrationTest {
     private EventStore eventStore;
 
     @Autowired
+    private IdempotentEventProcessor idempotentEventProcessor;
+
+    @Autowired
     private EmbeddedKafkaBroker embeddedKafkaBroker;
 
     @AfterEach
     void tearDown() {
         eventStore.clear();
+        idempotentEventProcessor.clear();
     }
 
     @Test
@@ -179,6 +184,81 @@ class RelayKafkaIntegrationTest {
                         .isEqualTo(sequence);
             });
         }
+    }
+
+    @Test
+    void duplicateKafkaEvent_recordedOnceInEventStore_whileKafkaTopicContainsBothRecords() {
+        String testAggregateId = "agg-dup-kafka-" + UUID.randomUUID();
+        RelayEvent duplicateEvent = new RelayEvent(
+                "evt-dup-kafka-101",
+                testAggregateId,
+                "OrderPaid",
+                "{\"amount\":199.99}"
+        );
+
+        Map<String, Object> consumerProps = KafkaTestUtils.consumerProps("test-dup-verifier-group-" + UUID.randomUUID(), "true", embeddedKafkaBroker);
+        consumerProps.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        consumerProps.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, JsonDeserializer.class);
+        consumerProps.put(JsonDeserializer.TRUSTED_PACKAGES, "com.relay.event");
+        consumerProps.put(JsonDeserializer.VALUE_DEFAULT_TYPE, "com.relay.event.RelayEvent");
+        consumerProps.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+
+        DefaultKafkaConsumerFactory<String, RelayEvent> consumerFactory = new DefaultKafkaConsumerFactory<>(consumerProps);
+        try (Consumer<String, RelayEvent> testConsumer = consumerFactory.createConsumer()) {
+            embeddedKafkaBroker.consumeFromAnEmbeddedTopic(testConsumer, KafkaTopicConfig.RELAY_EVENTS_TOPIC);
+
+            // Publish exact same logical event twice to Kafka
+            producer.sendEvent(duplicateEvent).join();
+            producer.sendEvent(duplicateEvent).join();
+
+            // Verify EventStore records the logical event EXACTLY ONCE
+            await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+                List<RelayEvent> appEvents = eventStore.getReceivedEvents()
+                        .stream()
+                        .filter(e -> testAggregateId.equals(e.aggregateId()))
+                        .toList();
+                assertThat(appEvents).hasSize(1).contains(duplicateEvent);
+            });
+
+            // Verify Kafka topic physically contains BOTH records
+            List<ConsumerRecord<String, RelayEvent>> polledRecords = new ArrayList<>();
+            long startTime = System.currentTimeMillis();
+            while (polledRecords.size() < 2 && System.currentTimeMillis() - startTime < 10000) {
+                ConsumerRecords<String, RelayEvent> records = testConsumer.poll(Duration.ofMillis(500));
+                for (ConsumerRecord<String, RelayEvent> rec : records) {
+                    if (testAggregateId.equals(rec.key())) {
+                        polledRecords.add(rec);
+                    }
+                }
+            }
+
+            assertThat(polledRecords)
+                    .as("Kafka topic MUST contain both published physical records")
+                    .hasSize(2);
+            assertThat(polledRecords.get(0).value()).isEqualTo(duplicateEvent);
+            assertThat(polledRecords.get(1).value()).isEqualTo(duplicateEvent);
+        }
+    }
+
+    @Test
+    void sameAggregateId_differentEventIds_bothProcessedSuccessfully() {
+        String sharedAggregateId = "agg-same-key-" + UUID.randomUUID();
+        RelayEvent event1 = new RelayEvent("evt-same-key-1", sharedAggregateId, "StepOne", "{\"step\":1}");
+        RelayEvent event2 = new RelayEvent("evt-same-key-2", sharedAggregateId, "StepTwo", "{\"step\":2}");
+
+        producer.sendEvent(event1).join();
+        producer.sendEvent(event2).join();
+
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+            List<RelayEvent> appEvents = eventStore.getReceivedEvents()
+                    .stream()
+                    .filter(e -> sharedAggregateId.equals(e.aggregateId()))
+                    .toList();
+            assertThat(appEvents)
+                    .as("Both events sharing aggregateId but having distinct eventIds must be processed")
+                    .hasSize(2)
+                    .containsExactly(event1, event2);
+        });
     }
 
 }

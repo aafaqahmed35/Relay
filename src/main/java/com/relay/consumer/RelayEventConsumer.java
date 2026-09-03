@@ -12,15 +12,15 @@ public class RelayEventConsumer {
 
     private static final Logger log = LoggerFactory.getLogger(RelayEventConsumer.class);
 
-    private final EventStore eventStore;
+    private final IdempotentEventProcessor idempotentEventProcessor;
 
-    public RelayEventConsumer(EventStore eventStore) {
-        this.eventStore = eventStore;
+    public RelayEventConsumer(IdempotentEventProcessor idempotentEventProcessor) {
+        this.idempotentEventProcessor = idempotentEventProcessor;
     }
 
     @KafkaListener(topics = KafkaTopicConfig.RELAY_EVENTS_TOPIC, groupId = "relay-consumers")
     public void consume(RelayEvent event) {
         log.info("Consumed eventId={} with aggregateId={}", event.eventId(), event.aggregateId());
-        eventStore.record(event);
+        idempotentEventProcessor.process(event);
     }
 }

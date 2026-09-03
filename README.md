@@ -29,7 +29,16 @@ A small Kafka lab I built to understand event processing, retries, ordering, con
   - Kafka does **NOT** provide global ordering across the entire topic or across different partitions.
 - **Integration Test Proof:**
   - Relay's integration tests (`RelayKafkaIntegrationTest.sameKeyEvents_routedToSamePartition_andPreserveProducerOrdering`) demonstrate that a sequential series of events with the same `aggregateId` are produced to one single partition and consumed from that partition in exact producer sequence order (with strictly increasing offsets).
-  - Note: This test demonstrates single-producer sequential ordering for a shared key within its assigned partition; it does not claim global topic ordering or ordering across un-synchronized concurrent producers.
+- Note: This test demonstrates single-producer sequential ordering for a shared key within its assigned partition; it does not claim global topic ordering or ordering across un-synchronized concurrent producers.
+
+## Idempotent Consumption (Increment 4)
+- **At-Least-Once Delivery & Deduplication:** Kafka can redeliver records under at-least-once processing conditions (network retries, rebalances, or consumer restarts). Relay uses the unique `eventId` property of each event to suppress duplicate logical processing.
+- **Thread-Safe In-Memory Coordination:** `IdempotentEventProcessor` uses a JDK `ConcurrentHashMap<String, CompletableFuture<Void>>` structure to atomically coordinate in-flight attempts and remember completed event IDs.
+- **Failure Recovery:** If processing an event throws an exception, the processor releases the claim and completes exceptionally so that waiting or subsequent attempts can retry and process the event.
+- **Scope & Limitations:**
+  - Duplicate physical records may still exist on the Kafka topic (Relay does not attempt producer-side deduplication).
+  - Deduplication state is stored strictly in memory (`ConcurrentHashMap`).
+  - Application restart loses processed IDs; therefore, Relay does **NOT** claim end-to-end persistent exactly-once processing across application restarts.
 
 ## REST API
 - `POST /events`: Accepts a `RelayEvent` JSON payload, publishes it to `relay.events` with `aggregateId` as the Kafka key, and returns `202 Accepted`.
