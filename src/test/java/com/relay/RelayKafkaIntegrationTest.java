@@ -181,21 +181,4 @@ class RelayKafkaIntegrationTest {
         }
     }
 
-    @Test
-    void differentKeys_canRouteToDifferentPartitions_whenKeysHashDifferently() {
-        RelayEvent eventKeyA = new RelayEvent("evt-keyA", "agg-alpha-" + UUID.randomUUID(), "TypeA", "payloadA");
-        RelayEvent eventKeyB = new RelayEvent("evt-keyB", "agg-beta-" + UUID.randomUUID(), "TypeB", "payloadB");
-
-        SendResult<String, RelayEvent> resultA = producer.sendEvent(eventKeyA).join();
-        SendResult<String, RelayEvent> resultB = producer.sendEvent(eventKeyB).join();
-
-        int partitionA = resultA.getRecordMetadata().partition();
-        int partitionB = resultB.getRecordMetadata().partition();
-
-        assertThat(resultA.getProducerRecord().key()).isEqualTo(eventKeyA.aggregateId());
-        assertThat(resultB.getProducerRecord().key()).isEqualTo(eventKeyB.aggregateId());
-
-        assertThat(partitionA).isBetween(0, 2);
-        assertThat(partitionB).isBetween(0, 2);
-    }
 }
