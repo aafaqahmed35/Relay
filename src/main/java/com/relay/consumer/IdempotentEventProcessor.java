@@ -11,10 +11,12 @@ import java.util.concurrent.ConcurrentHashMap;
 public class IdempotentEventProcessor {
 
     private final EventStore eventStore;
+    private final ProcessingAttemptTracker attemptTracker;
     private final ConcurrentHashMap<String, CompletableFuture<Void>> processingFutures = new ConcurrentHashMap<>();
 
-    public IdempotentEventProcessor(EventStore eventStore) {
+    public IdempotentEventProcessor(EventStore eventStore, ProcessingAttemptTracker attemptTracker) {
         this.eventStore = eventStore;
+        this.attemptTracker = attemptTracker;
     }
 
     public boolean process(RelayEvent event) {
@@ -31,6 +33,12 @@ public class IdempotentEventProcessor {
             if (existingFuture == null) {
                 // This thread atomically claimed ownership of processing for eventId
                 try {
+                    attemptTracker.recordAttempt(eventId);
+
+                    if ("FAIL_ALWAYS".equals(event.type())) {
+                        throw new RuntimeException("Simulated processing failure for FAIL_ALWAYS");
+                    }
+
                     eventStore.record(event);
                     newFuture.complete(null);
                     return true;

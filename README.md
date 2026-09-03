@@ -40,6 +40,17 @@ A small Kafka lab I built to understand event processing, retries, ordering, con
   - Deduplication state is stored strictly in memory (`ConcurrentHashMap`).
   - Application restart loses processed IDs; therefore, Relay does **NOT** claim end-to-end persistent exactly-once processing across application restarts.
 
+## Retry Behavior & Dead-Letter Handling (Increment 5)
+- **Bounded Retry Mechanism:** When event processing throws an exception, the failure propagates to Spring Kafka's `DefaultErrorHandler`. Relay configures a `FixedBackOff(100L, 2L)` strategy which enforces **1 initial delivery attempt + 2 retries = 3 maximum processing attempts total**. Retries are bounded and not infinite.
+- **Dead-Letter Topic (`relay.events.DLT`):** After 3 failed attempts, `DeadLetterPublishingRecoverer` automatically publishes the exhausted record to `relay.events.DLT`.
+- **Preserved Record Attributes:** The recoverer preserves the original message key (`aggregateId`), value (`RelayEvent`), and target partition index (3 partitions on DLT matching source topic).
+- **Poison Message Isolation:** Dead-lettering prevents unrecoverable records from endlessly blocking partition consumption, allowing subsequent valid events to continue processing normally.
+- **Scope & Limitations:**
+  - Retry and DLT mechanisms do **NOT** establish exactly-once business processing.
+  - At-least-once delivery duplicates remain possible.
+  - In-memory deduplication state is cleared on application restart.
+  - Relay does not claim production-grade distributed transaction handling or persistent multi-node deduplication.
+
 ## REST API
 - `POST /events`: Accepts a `RelayEvent` JSON payload, publishes it to `relay.events` with `aggregateId` as the Kafka key, and returns `202 Accepted`.
 

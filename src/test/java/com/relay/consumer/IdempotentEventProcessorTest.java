@@ -16,12 +16,14 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class IdempotentEventProcessorTest {
 
     private EventStore eventStore;
+    private ProcessingAttemptTracker attemptTracker;
     private IdempotentEventProcessor processor;
 
     @BeforeEach
     void setUp() {
         eventStore = new EventStore();
-        processor = new IdempotentEventProcessor(eventStore);
+        attemptTracker = new ProcessingAttemptTracker();
+        processor = new IdempotentEventProcessor(eventStore, attemptTracker);
     }
 
     @Test
@@ -118,7 +120,7 @@ class IdempotentEventProcessorTest {
             }
         };
 
-        IdempotentEventProcessor failingProcessor = new IdempotentEventProcessor(failingStore);
+        IdempotentEventProcessor failingProcessor = new IdempotentEventProcessor(failingStore, attemptTracker);
 
         // First attempt throws exception
         assertThatThrownBy(() -> failingProcessor.process(event))
@@ -159,7 +161,7 @@ class IdempotentEventProcessorTest {
             }
         };
 
-        IdempotentEventProcessor raceProcessor = new IdempotentEventProcessor(failingStore);
+        IdempotentEventProcessor raceProcessor = new IdempotentEventProcessor(failingStore, attemptTracker);
         ExecutorService executor = Executors.newFixedThreadPool(2);
 
         // Thread 1: Claims claim first, then pauses before failing
