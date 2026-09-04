@@ -51,6 +51,20 @@ A small Kafka lab I built to understand event processing, retries, ordering, con
   - In-memory deduplication state is cleared on application restart.
   - Relay does not claim production-grade distributed transaction handling or persistent multi-node deduplication.
 
+## Consumer Groups & Rebalance Behavior (Increment 6)
+- **Consumer Group Cooperation:** Multiple consumers configured with the same group ID share the work of consuming records from a topic. Kafka's group coordinator dynamically divides topic partitions among active group members.
+- **Single-Consumer Partition Ownership:** Within a consumer group, Kafka assigns each partition to **at most one active consumer** at a time. This guarantees that messages within a single partition are processed sequentially by a single worker without concurrent offset collisions.
+- **Parallelism & Partition Bounding:** Because `relay.events` has 3 partitions, useful consumer parallelism for a single consumer group is bounded by 3 active partition owners. Adding more than 3 consumers to the same group will leave extra consumers idle without partition assignments.
+- **Rebalance Triggering & Redistribution:** Adding a new consumer to a group or shutting down an existing consumer triggers group rebalancing. The group coordinator reassigns partition ownership, redistributing partitions among active members (e.g., transitioning from 1 consumer owning all 3 partitions to 2 consumers non-overlappingly sharing 3 partitions, and back upon consumer leave).
+- **Ordering Semantics & Rebalance Impact:**
+  - Message ordering remains strictly a **partition-level guarantee**. Consumer group partition division does **not** provide global ordering across different partitions.
+  - Group rebalances may briefly pause record processing while partition ownership transfers between consumers.
+- **Application Listener & Integration Verification:**
+  - Relay's application listener (`RelayEventConsumer`) uses group ID `relay-consumers`. Running multiple instances of the application with this group ID would naturally participate in group assignment.
+  - Relay's integration tests (`RelayKafkaIntegrationTest.consumerGroup_dividesPartitionOwnership_withoutOverlap` and `RelayKafkaIntegrationTest.consumerMembershipChange_triggersRebalanceAndRedistributesPartitions`) use real Embedded Kafka group coordination to verify disjoint partition assignment, complete group topic coverage, and dynamic reassignment during membership changes.
+- **Scope & Limitations:**
+  - Relay does **NOT** claim zero-downtime rebalancing, fixed partition-to-consumer mappings, global topic ordering, or production-grade dynamic autoscaling framework.
+
 ## REST API
 - `POST /events`: Accepts a `RelayEvent` JSON payload, publishes it to `relay.events` with `aggregateId` as the Kafka key, and returns `202 Accepted`.
 

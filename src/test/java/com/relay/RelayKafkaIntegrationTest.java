@@ -11,6 +11,7 @@ import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.common.serialization.StringDeserializer;
+import org.apache.kafka.common.TopicPartition;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -25,10 +26,14 @@ import org.springframework.test.annotation.DirtiesContext;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
@@ -426,4 +431,120 @@ class RelayKafkaIntegrationTest {
         });
     }
 
+    private Consumer<String, RelayEvent> createRawConsumer(String groupId, String clientId) {
+        Map<String, Object> consumerProps = KafkaTestUtils.consumerProps(groupId, "false", embeddedKafkaBroker);
+        consumerProps.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        consumerProps.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, JsonDeserializer.class);
+        consumerProps.put(JsonDeserializer.TRUSTED_PACKAGES, "com.relay.event");
+        consumerProps.put(JsonDeserializer.VALUE_DEFAULT_TYPE, "com.relay.event.RelayEvent");
+        consumerProps.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        consumerProps.put(ConsumerConfig.CLIENT_ID_CONFIG, clientId);
+
+        DefaultKafkaConsumerFactory<String, RelayEvent> consumerFactory = new DefaultKafkaConsumerFactory<>(consumerProps);
+        return consumerFactory.createConsumer();
+    }
+
+    @Test
+    void consumerGroup_dividesPartitionOwnership_withoutOverlap() {
+        String sharedGroupId = "test-group-divides-" + UUID.randomUUID();
+
+        try (Consumer<String, RelayEvent> consumerA = createRawConsumer(sharedGroupId, "consumer-a-" + UUID.randomUUID());
+             Consumer<String, RelayEvent> consumerB = createRawConsumer(sharedGroupId, "consumer-b-" + UUID.randomUUID())) {
+
+            consumerA.subscribe(Collections.singletonList(KafkaTopicConfig.RELAY_EVENTS_TOPIC));
+            consumerB.subscribe(Collections.singletonList(KafkaTopicConfig.RELAY_EVENTS_TOPIC));
+
+            await().atMost(Duration.ofSeconds(15)).pollInterval(Duration.ofMillis(200)).untilAsserted(() -> {
+                consumerA.poll(Duration.ofMillis(100));
+                consumerB.poll(Duration.ofMillis(100));
+
+                Set<Integer> partitionsA = consumerA.assignment().stream()
+                        .map(TopicPartition::partition)
+                        .collect(Collectors.toSet());
+                Set<Integer> partitionsB = consumerB.assignment().stream()
+                        .map(TopicPartition::partition)
+                        .collect(Collectors.toSet());
+
+                assertThat(partitionsA).as("Consumer A must own at least one partition").isNotEmpty();
+                assertThat(partitionsB).as("Consumer B must own at least one partition").isNotEmpty();
+
+                Set<Integer> union = new HashSet<>(partitionsA);
+                union.addAll(partitionsB);
+                assertThat(union).as("Union of consumer assignments must cover all 3 partitions").containsExactlyInAnyOrder(0, 1, 2);
+
+                Set<Integer> intersection = new HashSet<>(partitionsA);
+                intersection.retainAll(partitionsB);
+                assertThat(intersection).as("Consumer assignments must be disjoint (no partition assigned to both)").isEmpty();
+            });
+        }
+    }
+
+    @Test
+    void consumerMembershipChange_triggersRebalanceAndRedistributesPartitions() {
+        String sharedGroupId = "test-group-rebalance-" + UUID.randomUUID();
+
+        Consumer<String, RelayEvent> consumerA = createRawConsumer(sharedGroupId, "consumer-a-" + UUID.randomUUID());
+        Consumer<String, RelayEvent> consumerB = null;
+
+        try {
+            consumerA.subscribe(Collections.singletonList(KafkaTopicConfig.RELAY_EVENTS_TOPIC));
+
+            // Poll Consumer A until group assignment stabilizes and A owns all 3 partitions
+            await().atMost(Duration.ofSeconds(15)).pollInterval(Duration.ofMillis(200)).untilAsserted(() -> {
+                consumerA.poll(Duration.ofMillis(100));
+                Set<Integer> initialPartitionsA = consumerA.assignment().stream()
+                        .map(TopicPartition::partition)
+                        .collect(Collectors.toSet());
+                assertThat(initialPartitionsA).as("Single active consumer initially owns all 3 partitions").containsExactlyInAnyOrder(0, 1, 2);
+            });
+
+            // Start Consumer B in the same consumer group
+            consumerB = createRawConsumer(sharedGroupId, "consumer-b-" + UUID.randomUUID());
+            consumerB.subscribe(Collections.singletonList(KafkaTopicConfig.RELAY_EVENTS_TOPIC));
+
+            final Consumer<String, RelayEvent> finalB = consumerB;
+
+            // Poll both consumers until rebalance completes and partition redistribution is reflected
+            await().atMost(Duration.ofSeconds(15)).pollInterval(Duration.ofMillis(200)).untilAsserted(() -> {
+                consumerA.poll(Duration.ofMillis(100));
+                finalB.poll(Duration.ofMillis(100));
+
+                Set<Integer> partitionsA = consumerA.assignment().stream()
+                        .map(TopicPartition::partition)
+                        .collect(Collectors.toSet());
+                Set<Integer> partitionsB = finalB.assignment().stream()
+                        .map(TopicPartition::partition)
+                        .collect(Collectors.toSet());
+
+                assertThat(partitionsB).as("Consumer B must receive at least one partition after joining").isNotEmpty();
+                assertThat(partitionsA).as("Consumer A's assignment must change after Consumer B joins").isNotEqualTo(Set.of(0, 1, 2));
+
+                Set<Integer> union = new HashSet<>(partitionsA);
+                union.addAll(partitionsB);
+                assertThat(union).as("Union of assignments must still cover all 3 partitions").containsExactlyInAnyOrder(0, 1, 2);
+
+                Set<Integer> intersection = new HashSet<>(partitionsA);
+                intersection.retainAll(partitionsB);
+                assertThat(intersection).as("Assignments after rebalance must remain non-overlapping").isEmpty();
+            });
+
+            // Optional leave/rejoin demonstration: Close Consumer B and verify Consumer A regains all partitions
+            consumerB.close();
+            consumerB = null;
+
+            await().atMost(Duration.ofSeconds(15)).pollInterval(Duration.ofMillis(200)).untilAsserted(() -> {
+                consumerA.poll(Duration.ofMillis(100));
+                Set<Integer> regainedPartitionsA = consumerA.assignment().stream()
+                        .map(TopicPartition::partition)
+                        .collect(Collectors.toSet());
+                assertThat(regainedPartitionsA).as("After Consumer B leaves, Consumer A regains all 3 partitions").containsExactlyInAnyOrder(0, 1, 2);
+            });
+
+        } finally {
+            if (consumerB != null) {
+                consumerB.close();
+            }
+            consumerA.close();
+        }
+    }
 }
