@@ -67,8 +67,8 @@ Kafka delivers records from each assigned partition in partition order to the co
 
 ## Delivery Semantics
 
-* **At-Least-Once Behavior:** Relay demonstrates at-least-once-style consumer behavior. When processing fails, Spring Kafka error handling triggers message redelivery.
-* **Duplicate Occurrence:** Network retries, consumer restarts, or rebalances can cause duplicate physical records to be received by the consumer.
+* **At-Least-Once Behavior:** Relay demonstrates at-least-once-style consumer behavior. If processing fails before the record is successfully handled, the same Kafka record may be delivered to the consumer again under the configured retry/recovery behavior. Consumer restarts, rebalances, or failures around offset progress can also lead to a previously seen record being processed again.
+* **Physical vs. Logical Duplicates:** Producers or upstream systems may also publish multiple physical Kafka records representing the same logical event. Relay’s duplicate-event test deliberately publishes the same `RelayEvent` twice and demonstrates that both physical records can exist in Kafka while the in-process idempotency layer performs the logical operation once for that `eventId`.
 * **No Exactly-Once Claim:** Relay does **not** claim end-to-end exactly-once business processing. Broker delivery semantics and application-side business effects are strictly separate concerns.
 
 ## Idempotent Consumption
