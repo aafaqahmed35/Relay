@@ -2,114 +2,177 @@
 
 A small Kafka lab I built to understand event processing, retries, ordering, consumer groups, and handling duplicate or failed messages.
 
-## Current Stack
-- Java 21
-- Spring Boot 3.4.3
-- Apache Kafka (KRaft mode via Docker Compose)
-- Spring for Apache Kafka
-- Maven
-- Docker Compose
+## Purpose
 
-## Architecture & Configuration (Increment 2 & 3)
-- **Topic:** `relay.events` (3 partitions, replication factor 1)
-- **Kafka Record Key:** `aggregateId` (used for partition routing)
-- **Consumer Group:** `relay-consumers`
-- **Event Model (`RelayEvent`):**
-  - `eventId`: Unique event identifier
-  - `aggregateId`: Aggregate identifier used as Kafka message key
-  - `type`: Event domain type name
-  - `payload`: Event JSON string payload
+Relay is intentionally a small Kafka behavior lab designed to explore core messaging semantics—such as partition keying, consumer group coordination, idempotent consumption, bounded retries, and dead-letter publishing—rather than a full-scale distributed business application.
 
-## Kafka Key, Partitioning, and Ordering Semantics
-- **Kafka Key and Partitioning:**
-  - Relay passes `aggregateId` as the record key to `KafkaTemplate.send(...)`.
-  - Kafka routes records with the same key consistently to the same partition (so long as the partition topology of 3 partitions remains unchanged).
-- **Ordering Guarantees:**
-  - Kafka guarantees record ordering **only within a partition**.
-  - Kafka does **NOT** provide global ordering across the entire topic or across different partitions.
-- **Integration Test Proof:**
-  - Relay's integration tests (`RelayKafkaIntegrationTest.sameKeyEvents_routedToSamePartition_andPreserveProducerOrdering`) demonstrate that a sequential series of events with the same `aggregateId` are produced to one single partition and consumed from that partition in exact producer sequence order (with strictly increasing offsets).
-- Note: This test demonstrates single-producer sequential ordering for a shared key within its assigned partition; it does not claim global topic ordering or ordering across un-synchronized concurrent producers.
+## Architecture
 
-## Idempotent Consumption (Increment 4)
-- **At-Least-Once Delivery & Deduplication:** Kafka can redeliver records under at-least-once processing conditions (network retries, rebalances, or consumer restarts). Relay uses the unique `eventId` property of each event to suppress duplicate logical processing.
-- **Thread-Safe In-Memory Coordination:** `IdempotentEventProcessor` uses a JDK `ConcurrentHashMap<String, CompletableFuture<Void>>` structure to atomically coordinate in-flight attempts and remember completed event IDs.
-- **Failure Recovery:** If processing an event throws an exception, the processor releases the claim and completes exceptionally so that waiting or subsequent attempts can retry and process the event.
-- **Scope & Limitations:**
-  - Duplicate physical records may still exist on the Kafka topic (Relay does not attempt producer-side deduplication).
-  - Deduplication state is stored strictly in memory (`ConcurrentHashMap`).
-  - Application restart loses processed IDs; therefore, Relay does **NOT** claim end-to-end persistent exactly-once processing across application restarts.
+The end-to-end flow of Relay is structured as follows:
 
-## Retry Behavior & Dead-Letter Handling (Increment 5)
-- **Bounded Retry Mechanism:** When event processing throws an exception, the failure propagates to Spring Kafka's `DefaultErrorHandler`. Relay configures a `FixedBackOff(100L, 2L)` strategy which enforces **1 initial delivery attempt + 2 retries = 3 maximum processing attempts total**. Retries are bounded and not infinite.
-- **Dead-Letter Topic (`relay.events.DLT`):** After 3 failed attempts, `DeadLetterPublishingRecoverer` automatically publishes the exhausted record to `relay.events.DLT`.
-- **Preserved Record Attributes:** The recoverer preserves the original message key (`aggregateId`), value (`RelayEvent`), and target partition index (3 partitions on DLT matching source topic).
-- **Poison Message Isolation:** Dead-lettering prevents unrecoverable records from endlessly blocking partition consumption, allowing subsequent valid events to continue processing normally.
-- **Scope & Limitations:**
-  - Retry and DLT mechanisms do **NOT** establish exactly-once business processing.
-  - At-least-once delivery duplicates remain possible.
-  - In-memory deduplication state is cleared on application restart.
-  - Relay does not claim production-grade distributed transaction handling or persistent multi-node deduplication.
-
-## Consumer Groups & Rebalance Behavior (Increment 6)
-- **Consumer Group Cooperation:** Multiple consumers configured with the same group ID share the work of consuming records from a topic. Kafka's group coordinator dynamically divides topic partitions among active group members.
-- **Single-Consumer Partition Ownership:** Within a consumer group, Kafka assigns each partition to **at most one active consumer** at a time. This guarantees that messages within a single partition are processed sequentially by a single worker without concurrent offset collisions.
-- **Parallelism & Partition Bounding:** Because `relay.events` has 3 partitions, useful consumer parallelism for a single consumer group is bounded by 3 active partition owners. Adding more than 3 consumers to the same group will leave extra consumers idle without partition assignments.
-- **Rebalance Triggering & Redistribution:** Adding a new consumer to a group or shutting down an existing consumer triggers group rebalancing. The group coordinator reassigns partition ownership, redistributing partitions among active members (e.g., transitioning from 1 consumer owning all 3 partitions to 2 consumers non-overlappingly sharing 3 partitions, and back upon consumer leave).
-- **Ordering Semantics & Rebalance Impact:**
-  - Message ordering remains strictly a **partition-level guarantee**. Consumer group partition division does **not** provide global ordering across different partitions.
-  - Group rebalances may briefly pause record processing while partition ownership transfers between consumers.
-- **Application Listener & Integration Verification:**
-  - Relay's application listener (`RelayEventConsumer`) uses group ID `relay-consumers`. Running multiple instances of the application with this group ID would naturally participate in group assignment.
-  - Relay's integration tests (`RelayKafkaIntegrationTest.consumerGroup_dividesPartitionOwnership_withoutOverlap` and `RelayKafkaIntegrationTest.consumerMembershipChange_triggersRebalanceAndRedistributesPartitions`) use real Embedded Kafka group coordination to verify disjoint partition assignment, complete group topic coverage, and dynamic reassignment during membership changes.
-- **Scope & Limitations:**
-  - Relay does **NOT** claim zero-downtime rebalancing, fixed partition-to-consumer mappings, global topic ordering, or production-grade dynamic autoscaling framework.
-
-## REST API
-- `POST /events`: Accepts a `RelayEvent` JSON payload, publishes it to `relay.events` with `aggregateId` as the Kafka key, and returns `202 Accepted`.
-
-Example Request:
-```json
-{
-  "eventId": "evt-1001",
-  "aggregateId": "order-42",
-  "type": "OrderPlaced",
-  "payload": "{\"amount\": 99.99}"
-}
+```
+POST /events -> Producer -> relay.events -> Consumer -> success OR retry -> exhausted -> relay.events.DLT
 ```
 
-## Local Kafka Setup
+* **Spring Boot Producer:** Accepts event payloads via REST API and publishes them to Kafka.
+* **Kafka Topic (`relay.events`):** Topic configured with 3 partitions and replication factor 1.
+* **Application Consumer:** Single application listener (`relay-consumers` group) processing events.
+* **In-Memory Duplicate-Safe Processing:** Deduplication engine preventing double-processing of identical event IDs within a running process.
+* **Bounded Spring Kafka Retries:** Automatically retries failed event processing up to 3 total attempts.
+* **Dead-Letter Topic (`relay.events.DLT`):** Topic with 3 partitions where exhausted failed messages are published for isolation.
 
-Start local Kafka broker:
+## Event Model
+
+Relay processes events defined by the `RelayEvent` model:
+
+* `eventId`: Unique string identifier for each event instance (used for deduplication).
+* `aggregateId`: Aggregate domain identifier passed as the Kafka record key.
+* `type`: Event type name (e.g., `OrderPlaced`, or `FAIL_ALWAYS` for testing error paths).
+* `payload`: Event payload content string.
+
+The `aggregateId` serves as the Kafka message key.
+
+## Kafka Key + Partitioning
+
+* **Key Assignment:** The producer explicitly supplies `aggregateId` as the Kafka record key when sending to `relay.events`.
+* **Partition Routing:** Records sharing the same key are routed consistently to the same partition under Relay's 3-partition topic configuration.
+* **Observed Partitioning:** Sequential sends using the same key were experimentally demonstrated to land on the exact same partition.
+* **Ordering Scope:** Kafka guarantees message ordering **only within a single partition**.
+* **Global Ordering Disclaimer:** There is no global ordering across different partitions or topic-wide. If partition counts or topic configurations change, fixed partition index mapping may also shift.
+
+## Ordering
+
+Integration tests demonstrate partition-level ordering:
+
+* Sequential events sent with the same `aggregateId` land on the same partition with strictly increasing record offsets.
+* The application consumer receives and processes these records in their original send order.
+
+**Explicit Scope Boundary:** This partition ordering demonstration does **not** prove ordering across:
+* Different partitions;
+* Unrelated aggregate keys;
+* Arbitrary concurrent producers publishing to the same topic.
+
+## Consumer Groups
+
+Relay implements standard Apache Kafka consumer group semantics:
+
+* **Partition Ownership Division:** Consumers sharing a group ID (`relay-consumers`) dynamically divide topic partition ownership among active members.
+* **Single Active Owner Per Partition:** Within a single consumer group, each topic partition is assigned to at most one active consumer at a time.
+* **Parallelism Bound:** With 3 topic partitions, at most 3 consumers in one group can actively own partitions simultaneously. Any additional consumers joining the group remain idle.
+* **Rebalance & Reassignment:** Consumers joining or leaving the group trigger a Kafka rebalance, redistributing partition assignments across active members. Rebalancing can temporarily interrupt consumption while ownership transfers.
+* **Test Verification:** Integration tests verify group behavior using real Embedded Kafka group coordination via `subscribe(...)` (not manual `assign(...)`).
+
+**Processing Semantics Wording:**
+Kafka delivers records from each assigned partition in partition order to the consumer. Relay’s current listener processes records synchronously, but application-side concurrency choices could change processing behavior.
+
+## Delivery Semantics
+
+* **At-Least-Once Behavior:** Relay demonstrates at-least-once-style consumer behavior. When processing fails, Spring Kafka error handling triggers message redelivery.
+* **Duplicate Occurrence:** Network retries, consumer restarts, or rebalances can cause duplicate physical records to be received by the consumer.
+* **No Exactly-Once Claim:** Relay does **not** claim end-to-end exactly-once business processing. Broker delivery semantics and application-side business effects are strictly separate concerns.
+
+## Idempotent Consumption
+
+* **Event ID Deduplication:** Duplicate suppression is based on the unique `eventId`.
+* **In-Memory Coordination:** `IdempotentEventProcessor` manages claims using a thread-safe `ConcurrentHashMap<String, CompletableFuture<Void>>`.
+* **Concurrency Handling:** The first attempt acquires ownership of the `eventId`. Concurrent duplicate requests wait on the active attempt's completion.
+* **State Lifecycle:** Successful processing leaves the `eventId` marked in memory so future duplicates are ignored. Processing failure releases the claim so subsequent retries can re-attempt processing.
+* **Logical Side Effects:** Duplicate physical Kafka records may arrive, but logical processing occurs once per `eventId` during the execution of the process.
+
+**Prominent Limitations:**
+* Deduplication state is stored entirely in memory (`ConcurrentHashMap`).
+* Restarting the application clears all processed event IDs.
+* Duplicates received after an application restart will be re-processed.
+* Relay provides no persistent or multi-node distributed deduplication guarantee.
+
+## Retry + Dead-Letter Handling
+
+* **Configuration:** `FixedBackOff(100L, 2L)` enforces **1 original attempt + 2 retries = 3 maximum processing attempts**.
+* **Synthetic Failure Event:** The `FAIL_ALWAYS` event type deterministically throws an exception to demonstrate retry and recovery behavior.
+* **Dead-Letter Publishing:** When all 3 attempts are exhausted, `DeadLetterPublishingRecoverer` publishes the record to `relay.events.DLT`.
+* **DLT Configuration:** `relay.events.DLT` is configured with 3 partitions. Relay's demonstrated configuration preserves the original Kafka key (`aggregateId`), `RelayEvent` value, and target partition index when routing to the DLT.
+* **Poison Record Isolation:** Moving the exhausted poison record to the DLT allows subsequent valid events on the same partition to continue processing normally.
+* **Non-Resolution:** The DLT does not resolve or fix the failed business event; it merely parks the record for inspection and offline analysis.
+
+## Running Locally
+
+### Prerequisites
+* Docker & Docker Compose
+* Java 21+
+
+### 1. Start Kafka Broker
 ```bash
 docker compose up -d
 ```
 
-Stop local Kafka broker:
-```bash
-docker compose down
-```
-
-## Running & Verification Commands
-
-Run tests (includes WebMvc controller test & EmbeddedKafka partition/ordering integration tests):
-```bash
-./mvnw test
-```
-
-Package application:
-```bash
-./mvnw package
-```
-
-Run application:
+### 2. Run Spring Boot Application
 ```bash
 ./mvnw spring-boot:run
 ```
 
-Happy Path Demo:
+### 3. Stop Services
+```bash
+docker compose down
+```
+
+## Demo
+
+### Successful Event Processing
 ```bash
 curl -i -X POST http://localhost:8080/events \
   -H "Content-Type: application/json" \
   -d '{"eventId":"evt-demo-1","aggregateId":"order-101","type":"OrderPlaced","payload":"{\"amount\":250.00}"}'
 ```
+
+### Failure & Retry / DLT Demo
+```bash
+curl -i -X POST http://localhost:8080/events \
+  -H "Content-Type: application/json" \
+  -d '{"eventId":"evt-fail-1","aggregateId":"order-999","type":"FAIL_ALWAYS","payload":"{\"error\":\"test\"}"}'
+```
+
+## Tests
+
+Relay's test suite uses Spring Boot tests and `EmbeddedKafka` to verify real messaging behavior:
+
+* `POST /events` endpoint accepts requests and returns HTTP 202 Accepted.
+* Producer attaches `aggregateId` as the record key.
+* Happy-path event consumption and storage in `EventStore`.
+* Same-key sequential events land on the same partition in producer order.
+* Duplicate `eventId` suppression prevents double-processing.
+* Events with the same `aggregateId` but different `eventId`s are both processed.
+* Concurrent duplicate requests wait on the active attempt.
+* Failed processing releases the `eventId` claim so retries can acquire it.
+* Retry count is strictly bounded to 3 processing attempts.
+* Exhausted records are published to `relay.events.DLT` preserving key, value, and partition index.
+* Valid records are excluded from the DLT.
+* Same-partition consumption continues after a poison record is sent to the DLT.
+* Consumer group members non-overlappingly divide 3 partitions.
+* Group rebalancing redistributes partition ownership when members join or leave.
+
+*Note:* `EmbeddedKafka` provides integration test evidence within a single JVM process, but it is not a replacement for full production cluster failure testing.
+
+## Guarantees
+
+Relay strictly proves the following technical behaviors:
+
+* `aggregateId` is used as the Kafka message key.
+* Sequential sends with the same key land on the same partition in original send order.
+* Partition-level message ordering is preserved.
+* Duplicate `eventId`s are suppressed within a single running process under tested concurrency.
+* Processing retries are bounded to 3 total attempts.
+* Exhausted records are published to `relay.events.DLT`.
+* Consumer group partition ownership division and rebalance redistribution are verified.
+
+## Limitations
+
+* **No Global Ordering:** Ordering is guaranteed only per partition, not across topics or different keys.
+* **No Persistent Deduplication:** Deduplication state is in-memory; restarting the application clears state.
+* **No Exactly-Once Guarantees:** Relay does not claim end-to-end exactly-once business processing.
+* **No Database / Storage:** Event storage is in-memory for lab purposes.
+* **No Kafka Transactions:** Producer/consumer transactions are not enabled.
+* **No Distributed Deduplication:** Deduplication is single-process, not shared across multi-node instances.
+* **No Production Auth / Security:** Plaintext Kafka listeners, no TLS or SASL.
+* **No Schema Registry:** Messages rely on standard JSON serialization without schema versioning.
+* **No Production Deployment Architecture:** Designed strictly as a local learning lab.
+* **Embedded Kafka Limits:** Integration tests run on Embedded Kafka, which does not simulate all real-world cluster network partitions or broker failure scenarios.
